@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import urllib.request
 from datetime import datetime, timezone
 
 DB_PATH = os.path.expanduser("~/.pocketops/history.db")
@@ -593,6 +594,109 @@ PHONE_ACTIONS = {
 ADB_ACTIONS = {"tap", "swipe", "keyevent", "type", "open-app", "screenshot", "adb-status"}
 
 
+# =========================================================================
+# NGÔN NGỮ TỰ NHIÊN — "phone say" — hiểu câu tiếng Việt thường, không cần
+# nhớ đúng cú pháp lệnh. Đây là bản ĐOÁN TỪ KHOÁ (không cần API key,
+# không thông minh bằng Siri thật) — nếu muốn thông minh hơn, cần nối
+# với Claude API (tính năng nâng cấp, chưa làm ở bản này).
+# =========================================================================
+
+# Mỗi mục: (các từ khoá phải xuất hiện, hàm hành động, cách lấy tham số từ câu)
+_NLU_RULES = [
+    (["chụp màn hình", "chup man hinh", "screenshot"], "screenshot"),
+    (["về màn hình chính", "ve man hinh chinh", "home"], "keyevent:HOME"),
+    (["quay lại", "quay lai", "back", "thoát", "thoat"], "keyevent:BACK"),
+    (["rung", "vibrate"], "vibrate"),
+    (["pin", "battery"], "battery"),
+    (["xem lịch sử", "xem lich su", "history"], "__history__"),
+]
+
+
+def parse_natural_language(cau: str) -> tuple[str, list[str]] | None:
+    """Đoán hành động từ 1 câu tiếng Việt tự nhiên dựa theo từ khoá.
+    Trả về (action, args) hoặc None nếu không đoán được. Đây là cách ĐƠN
+    GIẢN, không phải AI thật — chỉ khớp cụm từ cố định."""
+    cau_thuong = cau.lower().strip()
+
+    # "mở <tên app>" -> cần map tên app quen thuộc sang package thật
+    if "mở" in cau_thuong or "mo " in cau_thuong:
+        APP_ALIASES = {
+            "liên quân": "com.garena.game.kgvn", "lien quan": "com.garena.game.kgvn",
+            "đồng hồ": "com.google.android.deskclock", "dong ho": "com.google.android.deskclock",
+            "chrome": "com.android.chrome",
+        }
+        for ten, package in APP_ALIASES.items():
+            if ten in cau_thuong:
+                return ("open-app", [package])
+        return None  # nhận ra ý định "mở" nhưng không rõ app nào -> không đoán mò
+
+    for tu_khoa_list, action in _NLU_RULES:
+        if any(tk in cau_thuong for tk in tu_khoa_list):
+            if ":" in action:
+                act, arg = action.split(":")
+                return (act, [arg])
+            return (action, [])
+    return None
+
+
+# =========================================================================
+# Gemini — nâng cấp "say" lên hiểu câu tự nhiên thật, không chỉ khớp từ khoá
+# =========================================================================
+# Cần: export GEMINI_API_KEY="AIzaSy..." (lấy free tại aistudio.google.com)
+# CHƯA TEST được với key thật trong sandbox này — Kaito test và gửi lại
+# lỗi/kết quả thật để debug đúng, không đoán mò thêm.
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_TIMEOUT = 15
+
+# Danh sách hành động Gemini ĐƯỢC PHÉP chọn — đây là lớp an toàn quan trọng:
+# dù AI trả lời gì, chỉ chạy nếu action nằm trong đúng danh sách này.
+_GEMINI_ALLOWED_ACTIONS = sorted(list(PHONE_ACTIONS.keys()) + ["__history__", "__unknown__"])
+
+
+def call_gemini(cau: str) -> tuple[str, list[str]] | None:
+    """Gửi câu tiếng Việt cho Gemini, yêu cầu trả về đúng JSON hành động.
+    Trả về None nếu lỗi bất kỳ (mạng, key sai, JSON hỏng...) để bên gọi
+    tự fallback sang cách đoán từ khoá, không bao giờ raise ra ngoài."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None
+
+    prompt = f"""Bạn là bộ phân tích lệnh điều khiển điện thoại. Đọc câu tiếng Việt của
+người dùng và trả về DUY NHẤT 1 dòng JSON, không giải thích gì thêm, đúng
+định dạng: {{"action": "<tên hành động>", "args": [<tham số dạng chuỗi>]}}
+
+Các hành động hợp lệ DUY NHẤT (không được bịa ra hành động khác):
+{', '.join(_GEMINI_ALLOWED_ACTIONS)}
+
+Nếu người dùng muốn mở app, dùng action "open-app" với args là tên package
+Android nếu bạn biết chắc (ví dụ Liên Quân là com.garena.game.kgvn), nếu
+không chắc chắn thì trả về action "__unknown__".
+Nếu không hiểu câu hoặc câu không liên quan điều khiển điện thoại, trả về
+{{"action": "__unknown__", "args": []}}
+
+Câu của người dùng: "{cau}\""""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(text)
+        action = parsed.get("action")
+        args = parsed.get("args", [])
+        if action not in _GEMINI_ALLOWED_ACTIONS:
+            return None
+        if action == "__unknown__":
+            return None
+        return (action, [str(a) for a in args])
+    except Exception:
+        return None
+
+
 def run_phone_action(action: str, args: list[str]) -> tuple[str, str]:
     """fix #2 + #3: bọc lỗi thiếu tham số / sai kiểu thành thông báo tiếng Việt gọn."""
     handler = PHONE_ACTIONS.get(action)
@@ -620,6 +724,7 @@ def _print_usage() -> None:
     print("  python pocketops_v0.py phone <hành động> [tham số...] [--dry-run]")
     print("  python pocketops_v0.py history [số_lượng]      # xem lại lịch sử đã chạy")
     print("  python pocketops_v0.py clear-history            # xoá sạch lịch sử")
+    print('  python pocketops_v0.py say "<câu tiếng Việt tự nhiên>"   # vd: say "mở liên quân"')
     print()
     print("  -- Nhóm termux-api (không cần ADB) --")
     print('  phone notify "Tiêu đề" "Nội dung"')
@@ -679,6 +784,37 @@ def main() -> None:
             so_dong = clear_history()
             print(f"[PocketOps] Đã xoá {so_dong} dòng lịch sử.")
 
+        elif mode == "say":
+            # [MỚI] tính năng thêm — hiểu câu tiếng Việt tự nhiên, không cần đúng cú pháp lệnh
+            if len(argv) < 2:
+                print('Dùng: python pocketops_v0.py say "<câu tiếng Việt, ví dụ: mở liên quân>"')
+                sys.exit(1)
+            cau = " ".join(argv[1:])
+            ket_qua = call_gemini(cau)  # thử AI thật trước nếu có GEMINI_API_KEY
+            nguon = "Gemini AI"
+            if ket_qua is None:
+                ket_qua = parse_natural_language(cau)  # fallback đoán từ khoá
+                nguon = "đoán từ khoá (không có/lỗi Gemini)"
+            if ket_qua is None:
+                print(f"[PocketOps] Không hiểu câu '{cau}'. Đây là bản đoán từ khoá đơn giản, "
+                      "chưa thông minh như Siri thật — dùng đúng cú pháp lệnh (xem: python pocketops_v0.py) "
+                      "hoặc thử câu khác rõ ý hơn.")
+                sys.exit(1)
+            action, args = ket_qua
+            if action == "__history__":
+                rows, tong_so = get_history(10)
+                print(f"[PocketOps] Tổng số lệnh đã lưu: {tong_so}")
+                for created_at, command, status in rows:
+                    print(f"  [{status:5}] {created_at}  {command}")
+            else:
+                print(f"[PocketOps] Hiểu là ({nguon}): {action} {' '.join(args)}")
+                output, status = run_phone_action(action, args)
+                print("---- Kết quả ----")
+                print(output if output else "(không có output, coi như thành công)")
+                _log_session(f"say: {cau} -> {action}", output, status)
+                if status == "error":
+                    sys.exit(1)
+
         elif mode == "setup-sandbox":
             output, status = setup_sandbox()
             print("---- Kết quả ----")
@@ -710,6 +846,8 @@ def main() -> None:
             print(output)
             _log_session(f"sandbox-run: {filename}", output, status)
             print(f"[PocketOps] Đã lưu log (trạng thái: {status})")
+            if status == "error":
+                sys.exit(1)
 
         elif mode == "sandbox":
             if len(argv) < 2:
@@ -722,6 +860,8 @@ def main() -> None:
             print(output)
             _log_session(f"sandbox: {command}", output, status)
             print(f"[PocketOps] Đã lưu log (trạng thái: {status})")
+            if status == "error":
+                sys.exit(1)
 
         elif mode == "phone":
             if len(argv) < 2:
@@ -743,6 +883,8 @@ def main() -> None:
                 log_cmd = f"phone(termux-api) {action}: {' '.join(action_args)}"
             _log_session(log_cmd, output, status)
             print(f"[PocketOps] Đã lưu log (trạng thái: {status})")
+            if status == "error":  # [MỚI] fix: trả đúng exit code để && / script khác hoạt động đúng
+                sys.exit(1)
 
         else:
             print(f"Chế độ '{mode}' không hợp lệ.")
